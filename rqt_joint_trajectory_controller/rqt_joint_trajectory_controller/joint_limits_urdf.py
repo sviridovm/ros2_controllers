@@ -23,11 +23,12 @@
 # upper is an optional attribute, so I don't understand what's going on
 # See comments in https://github.com/ros/urdfdom/issues/36
 
-import xml.dom.minidom
 from math import pi
 
 import rclpy
 from std_msgs.msg import String
+
+from urdf_parser_py.urdf import URDF
 
 description = ""
 
@@ -55,71 +56,70 @@ def get_joint_limits(node, joints_names, use_smallest_joint_limits=True):
         count += 1
         rclpy.spin_once(node, timeout_sec=1.0)
 
+    if description == "":
+        return {}
+
+    # will raise exception if URDF is invalid
+    robot = URDF.from_xml_string(description)
+
     free_joints = {}
-    dependent_joints = {}
+    # dependent_joints = {}
+    dependent_joints = set()
 
-    if description != "":
-        robot = xml.dom.minidom.parseString(description).getElementsByTagName("robot")[0]
+    for joint_name, joint in robot.joints.items():
+        if joint.type == "fixed":
+            continue
 
-        # Find all non-fixed joints
-        for child in robot.childNodes:
-            if child.nodeType is child.TEXT_NODE:
+        if joint.limit is None:
+            if joint in joints_names:
+                # ? Is there a more specific exception we can raise here?
+                raise Exception(
+                    f"Missing limits tag for the joint : {joint_name} in the robot_description!"
+                )
+            else:
                 continue
-            if child.localName == "joint":
-                jtype = child.getAttribute("type")
-                if jtype == "fixed":
-                    continue
-                name = child.getAttribute("name")
 
-                try:
-                    limit = child.getElementsByTagName("limit")[0]
-                    try:
-                        minval = float(limit.getAttribute("lower"))
-                        maxval = float(limit.getAttribute("upper"))
-                    except ValueError:
-                        if jtype == "continuous":
-                            minval = -pi
-                            maxval = pi
-                        else:
-                            raise Exception(
-                                f"Missing lower/upper position limits for the joint : {name} of type : {jtype} in the robot_description!"
-                            )
-                    try:
-                        maxvel = float(limit.getAttribute("velocity"))
-                    except ValueError:
-                        raise Exception(
-                            f"Missing velocity limits for the joint : {name} of type : {jtype} in the robot_description!"
-                        )
-                except IndexError:
-                    if name in joints_names:
-                        raise Exception(
-                            f"Missing limits tag for the joint : {name} in the robot_description!"
-                        )
-                safety_tags = child.getElementsByTagName("safety_controller")
-                if use_small and len(safety_tags) == 1:
-                    tag = safety_tags[0]
-                    if tag.hasAttribute("soft_lower_limit"):
-                        minval = max(minval, float(tag.getAttribute("soft_lower_limit")))
-                    if tag.hasAttribute("soft_upper_limit"):
-                        maxval = min(maxval, float(tag.getAttribute("soft_upper_limit")))
+        # joint limits have default values of 0
+        minval = joint.limit.lower
+        maxval = joint.limit.upper
 
-                mimic_tags = child.getElementsByTagName("mimic")
-                if use_mimic and len(mimic_tags) == 1:
-                    tag = mimic_tags[0]
-                    entry = {"parent": tag.getAttribute("joint")}
-                    if tag.hasAttribute("multiplier"):
-                        entry["factor"] = float(tag.getAttribute("multiplier"))
-                    if tag.hasAttribute("offset"):
-                        entry["offset"] = float(tag.getAttribute("offset"))
+        has_position_limits = joint.type != "continuous"
+        maxvel = joint.limit.velocity
 
-                    dependent_joints[name] = entry
-                    continue
+        if joint.type == "continuous":
+            minval = -pi
+            maxval = pi
 
-                if name in dependent_joints:
-                    continue
+        if joint.safety_controller is not None and use_small:
+            safety = joint.safety_controller
+            if safety.soft_lower_limit is not None:
+                minval = max(minval, safety.soft_lower_limit)
+            if safety.soft_upper_limit is not None:
+                maxval = min(maxval, safety.soft_upper_limit)
 
-                joint = {"min_position": minval, "max_position": maxval}
-                joint["has_position_limits"] = jtype != "continuous"
-                joint["max_velocity"] = maxvel
-                free_joints[name] = joint
+        if joint.mimic is not None and use_mimic:
+            # ? Why do we use a map if we only check for membership by name?
+            # mimic = joint.mimic
+            # entry = {"parent": joint.mimic.joint}
+            # if mimic.multiplier is not None:
+            #     entry["factor"] = joint.mimic.multiplier
+            # if mimic.offset is not None:
+            #     entry["offset"] = joint.mimic.offset
+
+            # dependent_joints[joint_name] = entry
+
+            dependent_joints.add(joint_name)
+            continue
+
+        if joint_name in dependent_joints:
+            continue
+
+        joint_dict = {
+            "min_position": minval,
+            "max_position": maxval,
+            "has_position_limits": has_position_limits,
+            "max_velocity": maxvel,
+        }
+        free_joints[joint_name] = joint_dict
+
     return free_joints
